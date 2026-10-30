@@ -1,11 +1,11 @@
 # myC2-beacon
 
 C17 local learning simulator. It runs a fixed uptime task three times and exits.
-There is no server, networking, or command execution.
+It also provides a localhost heartbeat client and server; there is no command execution.
 
 ## Requirements
 
-- A C17 compiler (GCC, Clang, or MSVC)
+- Linux with a C17 compiler (GCC or Clang)
 - CMake 3.16 or newer
 
 ## Build and run
@@ -26,9 +26,6 @@ To follow the code in `src/main.c`, start with `main`, which selects the CLI
 action. `run_simulation` runs the fixed task and prints results;
 `monotonic_seconds` reads elapsed time, and `wait_one_second` pauses the loop.
 
-For multi-configuration generators such as Visual Studio, build with
-`cmake --build build --config Debug`. The executable is then under `build/Debug/`.
-
 ## Sanitizers
 
 AddressSanitizer and UndefinedBehaviorSanitizer are available with GCC or Clang:
@@ -47,3 +44,22 @@ src/main.c       CLI entry point, fixed local task, and timing helpers
 ```
 
 Build outputs are ignored by Git. No external dependencies are required.
+
+## Local heartbeat demo (Linux)
+
+Start the server in one terminal:
+
+```sh
+./build/myc2_beacon --server
+```
+
+Start the client in another:
+
+```sh
+./build/myc2_beacon --client
+```
+
+The client sends `HEARTBEAT` every second and prints each `OK` acknowledgment.
+The server logs connections, heartbeat acknowledgments, and disconnects or idle
+timeouts. Both use localhost port 8080. Stop either process with Ctrl+C.
+The client exits with an error if the connection fails or a reply times out.
