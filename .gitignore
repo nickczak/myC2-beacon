@@ -1,6 +1,12 @@
 # Prerequisites
 *.d
 
+# Local CMake builds
+/build/
+/build-*/
+/CMakeUserPresets.json
+/compile_commands.json
+
 # Object files
 *.o
 *.ko
