@@ -10,6 +10,11 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 static int monotonic_seconds(double *seconds)
@@ -77,6 +82,53 @@ static int run_simulation(void)
     return EXIT_SUCCESS;
 }
 
+static int run_connection(void)
+{
+#if defined(_WIN32)
+    fputs("Error: --connect currently requires a POSIX platform.\n", stderr);
+    return EXIT_FAILURE;
+#else
+    int sock = 0;
+    struct sockaddr_in serv_addr = {0};
+    const char *heartbeat = "HEARTBEAT";
+
+    puts("[beacon] Starting connection to C2 server (localhost)");
+
+    // Create socket
+    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        fputs("Error: could not create socket.\n", stderr);
+        return EXIT_FAILURE;
+    }
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(8080);
+
+    // Convert IPv4 and IPv6 addresses from text to binary form
+    if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
+        perror("Invalid address/ Address not supported");
+        return -1;
+    }
+
+    // Connect to the localhost 
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        perror("Connection failed");
+        return -1;
+    }
+
+    puts("[beacon] Connection established (simulated)");
+
+    // Send heartbeat
+    while (1) {
+        send(sock, heartbeat, strlen(heartbeat), 0);
+        puts("[beacon] Heartbeat sent");
+        sleep(5); // Wait for 5 seconds before sending the next heartbeat
+    }
+
+    close(sock);
+    return EXIT_SUCCESS;
+#endif
+}
+
 static void print_usage(FILE *stream)
 {
     fputs("Usage: myc2_beacon [--help | --version | --simulate]\n"
@@ -86,7 +138,8 @@ static void print_usage(FILE *stream)
           "Options:\n"
           "  --help     Show this help message\n"
           "  --version  Show the application version\n"
-          "  --simulate Run 3 local uptime tasks, 1 second apart\n", stream);
+          "  --simulate Run 3 local uptime tasks, 1 second apart\n"
+          "  --connect  Run the beacon to connect to a C2 server (localhost)\n", stream);
 }
 
 int main(int argc, char *argv[])
@@ -103,6 +156,10 @@ int main(int argc, char *argv[])
 
     if (argc == 2 && strcmp(argv[1], "--simulate") == 0) {
         return run_simulation();
+    }
+
+    if (argc == 2 && strcmp(argv[1], "--connect") == 0) {
+        return run_connection();
     }
 
     fputs("Error: unsupported arguments.\n", stderr);
