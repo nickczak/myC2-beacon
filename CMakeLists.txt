@@ -6,7 +6,7 @@ option(ENABLE_SANITIZERS "Enable address and undefined behavior sanitizers" OFF)
 option(BUILD_EXAMPLES "Build TCP examples and the HTTPS test server" OFF)
 
 find_package(CURL 7.85 REQUIRED)
-add_executable(http_demo examples/http/http_demo.c src/http.cpp)
+add_executable(http_demo examples/http/http_demo.c src/https.cpp)
 target_include_directories(http_demo PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(http_demo PRIVATE CURL::libcurl)
 
