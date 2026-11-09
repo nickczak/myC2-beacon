@@ -31,6 +31,8 @@ std::size_t write_response(char *data, std::size_t size, std::size_t count,
 }
 } // namespace
 
+namespace https
+{
 int POST(const char *server_address, const char *data, const char *ca_file)
 {
     if (server_address == nullptr || data == nullptr)
@@ -126,3 +128,4 @@ int POST(const char *server_address, const char *data, const char *ca_file)
     return response_code >= 200 && response_code < 300 ? EXIT_SUCCESS
                                                        : EXIT_FAILURE;
 }
+} // namespace https

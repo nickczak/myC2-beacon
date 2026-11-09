@@ -1,15 +1,18 @@
-#pragma once
+#ifndef CHECK_IN_PROTOCOL_H
+#define CHECK_IN_PROTOCOL_H
 
-// Force the compiler to pack data tightly without padding
-struct __attribute__((packed)) C2_HEADER {
-  unsigned int magic; // Magic number to identify the protocol
-  unsigned int command_id;
-  unsigned int payload_size; // Size of the payload following the header
+#include <stdint.h>
+
+#define CHECK_IN_MAGIC UINT32_C(0x41414141)
+#define CMD_CHECK_IN UINT32_C(100)
+#define CMD_EXIT UINT32_C(101)
+#define CMD_EXECUTE_SHELL UINT32_C(102)
+
+/* Each field is transmitted in network byte order. No payload follows. */
+struct C2_HEADER {
+  uint32_t magic;
+  uint32_t command_id;
+  uint32_t payload_size;
 };
 
-// Define the command types for the protocol
-typedef enum {
-  CMD_CHECK_IN = 100,
-  CMD_EXECUTE_COMMAND = 101,
-  CMD_EXIT = 102,
-} COMMAND_ID;
+#endif
