@@ -35,7 +35,7 @@ comes from that direction of travel:
 | **commands are never pushed** | they wait in a queue for the next poll |
 
 The cost of the last row: a command reaches the agent up to one beacon interval
-late (one poll interval, 3–7s in `src/implant/agent.c`), and its output is back
+late (one poll interval, 3–7s in `src/implant/beacon.c`), and its output is back
 on the console roughly one interval after that.
 
 ## 2. Two planes, not one
@@ -59,13 +59,13 @@ defender picks it up.
 | signal | current state | source |
 | --- | --- | --- |
 | **Certificate chain** | self-signed: `issuer == subject`, one-element chain, `CN=localhost` + IP SANs. Trivially an IOC to generate. | `src/server/CMakeLists.txt` |
-| **Cadence** | 3–7s, jittered from a 5s base. The even beat is gone; a fixed destination on a schedule is still a pattern. | `agent.c` `POLL_BASE_MS` / `POLL_JITTER_PERCENT` |
+| **Cadence** | 3–7s, jittered from a 5s base. The even beat is gone; a fixed destination on a schedule is still a pattern. | `beacon.c` `POLL_BASE_MS` / `POLL_JITTER_PERCENT` |
 | **Port** | 8443 fixed, and unusual in egress logs — ordinary traffic is overwhelmingly 443. | `beaconEndpoints.hpp` `kPort` |
-| **Path** | `/api/v2/metrics` and `/api/v2/events`, defined once in `src/protocol.h`. Telemetry-shaped, but still fixed strings. | both |
+| **Path** | `/api/v2/metrics` and `/api/v2/events`, defined once in `src/common/protocol.h`. Telemetry-shaped, but still fixed strings. | both |
 | **Artifact metadata** | stripped: no `.symtab`, no build id, no `.comment`, no string naming the role or the paths. Nothing left to triage from the file itself. **Verified** with `readelf`/`nm`/`strings`. | `src/implant/CMakeLists.txt` |
 | **Request shape** | `POST`, `Content-Type: application/octet-stream`, **no `User-Agent`**, no `Accept*`, no `Accept-Encoding`. A client with no UA at all is itself abnormal. | `https_client.c` `https_post` |
 | **Response shape** | every response carries `Keep-Alive: timeout=5, max=100` (httplib's default idle timeout). **Verified** live; there is *no* `Server:` header. | httplib |
-| **Body** | 12-byte binary header where byte 4 is `0x64`. Short, high-entropy-ish, unrecognised. | `src/protocol.h` |
+| **Body** | 16-byte binary header whose second word is `100` and fourth is a per-implant session id. Short, high-entropy-ish, unrecognised. | `src/common/protocol.h` |
 | **`Host` header** | omits the port (`Host: 1.2.3.4`, not `1.2.3.4:8443`), which is unusual for a non-default port. | `https_client.c` |
 | **Teamserver IP** | a fixed public address dialled on a schedule. | — |
 
@@ -132,17 +132,16 @@ Two ways to use it, with different requirements:
 1. **`server.listen("0.0.0.0", kPort)` binds every interface**, including the VPN
    one (`src/server/server.cpp`). Both endpoints are therefore reachable from
    inside the VPN as well as from the internet, and neither authenticates.
-2. **No authentication.** `/api/v2/metrics` calls `take_pending()`, which
-   **pops** the queue — so anyone who can reach that port can poll and *steal
-   your queued command*; the real agent then finds an empty queue. Anyone can
-   also POST a well-formed frame to `/api/v2/events` and put arbitrary text on
-   your console
-   (validated only for magic and length).
-3. **The check-in frame is never validated.** `/api/v2/metrics` discards the body
-   entirely (`(void)req;` in `beaconEndpoints.cpp`), so any body at all is
-   accepted as a check-in. Confirmed live: a hand-built 12-byte body returned
-   `204`. There is no per-victim identity anywhere — the server cannot tell two
-   implants apart.
+2. **No authentication.** `/api/v2/metrics` pops from the queue of whichever
+   session id the frame names — so anyone who can reach that port can claim a
+   known id and *steal its queued command*; the real agent then finds an empty
+   queue. Anyone can also POST a well-formed frame to `/api/v2/events` and put
+   arbitrary text on your console (validated only for magic, length and a
+   non-zero session id).
+3. **A session id is claimed, not proven.** The frame is now parsed and the
+   session id keys the queue, but nothing ties an id to a particular implant, so
+   the server cannot tell a real check-in from a forged one carrying the same id.
+   That is the authentication gap in item 2, seen from the other side.
 
 ## 5. Certificate strategy
 
@@ -181,18 +180,20 @@ Ordered by what unblocks deployment, not by difficulty.
 
 ### Blocks any real use
 
-1. **Per-session identity.** A session ID in the check-in, and the queue keyed by
-   it. Fixes "two implants interleave each other's commands" and the sticky
-   `exit` (`g_exit_requested` is never cleared), and is a prerequisite for
-   everything else. `beaconEndpoints.cpp`.
+1. ~~**Per-session identity.**~~ **Done.** A session id in the check-in, queues
+   keyed by it, a per-session exit flag, and every store operation sweeping stale
+   sessions. One command stays in flight until a result acknowledges it, so a
+   lost reply re-sends instead of losing the command. The remaining gap is
+   exactly-once: a re-send can run a command twice; see `src/server/README.md`.
 2. **Authentication on both endpoints.** A shared secret in a header, or a pinned
    client certificate. Without it the queue is drainable by anyone who can reach
    the port, and the console is writable by anyone.
 3. **Configurable bind address.** Replace `0.0.0.0` with an explicit interface so
    the beacon plane and operator plane can be separated. `server.cpp`.
-4. **Persistent command queue.** Move `g_queue` / `g_exit_requested` out of
-   process memory into a file, SQLite, or Redis. Required to survive a restart,
-   and mandatory for any deployment behind more than one process.
+4. **Persistent command queue.** Move `SessionStore` out of process memory into
+   a file, SQLite, or Redis. Required to survive a restart — today a restart
+   drops every queue and pending exit while the implant keeps beaconing — and
+   mandatory for any deployment behind more than one process.
 
 ### Required to host it anywhere but a loopback box
 
@@ -213,17 +214,17 @@ Ordered by what unblocks deployment, not by difficulty.
     advertise a stock HTTP server's defaults.
 10. **Path and port configurable**, so they are not constants compiled into both
     binaries.
-11. **Validate the check-in** on `/api/v2/metrics` the way `/api/v2/events` is
-    validated, so a malformed frame is rejected rather than treated as a
-    check-in.
+11. ~~**Validate the check-in** on `/api/v2/metrics`.~~ **Done.** Both handlers
+    call the same `frame_decode`, so a malformed frame is a `400` on either.
 
 ### Correctness, not stealth
 
-12. **Binary-safe console output.** `/api/v2/events` writes raw bytes to
-    `std::cout`
-    after a text header; non-UTF-8 output corrupts the terminal. Base64 or
-    hex-escape on the console.
-13. **Network byte order.** `src/protocol.h` documents host byte order, which is
+12. ~~**Binary-safe console output.**~~ **Done (control bytes).** Results are
+    escaped on the way out, so `0x00`-`0x1f` and `0x7f` print as `^X` and cannot
+    drive the terminal; bytes above `0x7f` pass through so UTF-8 survives. A
+    result that legitimately contains `^A` is indistinguishable from an escaped
+    `0x01`; hex or base64 would fix that at the cost of readability.
+13. **Network byte order.** `src/common/protocol.h` documents host byte order, which is
     correct only between same-endian hosts.
 15. **Larger result channel.** `OUTPUT_MAX` is 4096 bytes and output is only
     collected after the command exits, so a long-running command produces
@@ -232,9 +233,9 @@ Ordered by what unblocks deployment, not by difficulty.
 ## 7. Verifying a deployment
 
 ```sh
-# 1. does the beacon plane answer at all?
+# 1. does the beacon plane answer at all? (magic, 100, empty payload, id 1)
 curl -sk -i --http1.1 -X POST \
-  --data-binary $'\x41\x41\x41\x41\x64\x00\x00\x00\x00\x00\x00\x00' \
+  --data-binary $'\x41\x41\x41\x41\x64\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00' \
   https://<host>:8443/api/v2/metrics
 
 # 2. what does the chain look like to an observer?
@@ -260,12 +261,13 @@ VPN.
 ## Current state summary
 
 Working and verified: clean configure and build, TLS with enforced verification,
-framing validation on `/api/v2/events`, a 4-shared-library implant, reproducible
-container build, build-time certificate generation with a configurable SAN, a
-jittered 3–7s poll interval, and an implant binary with no symbol table, build id,
-compiler version or role-shaped strings.
+framing validation on both endpoints from one shared decoder, per-session queues
+with a 60s TTL, a 4-shared-library implant, reproducible container build,
+build-time certificate generation with a configurable SAN, a jittered 3–7s poll
+interval, and an implant binary with no symbol table, build id, compiler version
+or role-shaped strings.
 
-Not yet true: authentication, per-session state, a persistent queue, a remote
-operator interface, root-pinned trust, or any configurability of port, path or
-bind address. It is a working beacon channel; it is not deployable
-infrastructure.
+Not yet true: authentication in either direction, exactly-once delivery, a
+persistent queue, a remote operator interface, root-pinned trust, or any
+configurability of port, path or bind address. It is a working beacon channel;
+it is not deployable infrastructure.
