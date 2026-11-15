@@ -1,8 +1,15 @@
-add_executable(server server.cpp)
+add_executable(server
+    server.cpp
+    operatorConsole.cpp
+    operatorConsole.hpp
+    serverOutput.cpp
+    serverOutput.hpp)
 set_target_properties(server PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 target_link_libraries(server PRIVATE
     c2_common project_warnings httplib::httplib Threads::Threads)
+# The endpoint implementations live in a subdirectory and include these.
+target_include_directories(server PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 # The endpoint implementations add the rest of the server's sources.
 add_subdirectory(endpoints)

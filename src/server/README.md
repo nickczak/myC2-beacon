@@ -19,9 +19,13 @@ beacon instead of arriving immediately.
 
 | File | Contents |
 | --- | --- |
-| `server.cpp` | `main`, the operator console, certificate loading, `listen` |
-| `endpoints/beaconEndpoints.cpp` | the command queue and the two request handlers |
-| `endpoints/beaconEndpoints.hpp` | `kPort`, `kMaxPayload`, the `Pending` enum, queue API |
+| `server.cpp` | `main`, certificate loading, `listen`, request logging |
+| `operatorConsole.cpp` | `sessions` / `use` / `exit`, and queueing everything else |
+| `serverOutput.cpp` | the single write path to stdout: messages, prompt, `hex_id` |
+| `endpoints/beaconEndpoints.cpp` | the two request handlers |
+| `endpoints/beaconEndpoints.hpp` | `kPort`, `kMaxPayload`, `Pending` |
+| `endpoints/sessionStore.cpp` | per-session queues, the in-flight command, TTL sweep |
+| `endpoints/sessionStore.hpp` | `Session`, `SessionInfo`, `Pending`, `SessionStore` |
 
 `endpoints/` is compiled into the `server` target through
 `target_sources`; its headers are added to the target's private include path.
@@ -133,36 +137,57 @@ c2_server>
 The port is the compile-time constant `kPort` in `beaconEndpoints.hpp`. There is
 no command-line argument to change it or the bind address; both are `0.0.0.0`
 and `8443` as written. If the port is taken, the server prints
-`[-] Failed to listen on port 8443` and exits.
+`[-] Failed to bind 0.0.0.0:8443` and exits.
 
 ### Operator console
 
-A detached thread reads `std::cin` while `listen` blocks, so typing works from
-the moment the server starts.
+The port is bound before the console thread starts, so a port already in use
+fails immediately instead of leaving a thread blocked on stdin. After that a
+detached thread reads `std::cin` while `listen` runs.
 
 | input | effect |
 | --- | --- |
-| any other text | queued; handed to the implant on its next check-in |
-| `exit` | asks the implant to shut down |
+| `sessions` | list every live session id, `*` marking the selected one |
+| `use <hex id>` | send later commands to that session |
+| `exit` | ask the selected session to shut down |
+| `exit <hex id>` | ask that one session to shut down |
+| `exit all` | ask every session to shut down |
+| `quit` | stop reading input; the teamserver keeps serving |
+| any other text | queued for the selected session |
 
-Output arrives as it is uploaded:
+Nothing is queued until a session is selected:
 
 ```
 c2_server> id -u
-[*] POST /api/v2/metrics -> 200
+[-] no session selected; run `sessions` then `use <id>`
+c2_server> sessions
+[*] 1 session(s), * = receives commands
+    5f3a91c2  0s ago
+c2_server> use deadbeef
+[-] no session deadbeef; run `sessions`
+c2_server> use 5f3a91c2
+[*] using 5f3a91c2
+c2_server> id -u
+c2_server> [*] POST /api/v2/metrics -> 200
 
-[+] result (5 bytes):
+[+] result from 5f3a91c2 for `id -u` (5 bytes):
 1000
 [*] POST /api/v2/events -> 200
 ```
 
-`exit` sets a flag that is **never cleared**, so every later check-in is answered
-with `CMD_EXIT` until the server is restarted. The result printer writes raw
-bytes to the terminal after a text header, so binary output will corrupt it.
+`exit` sets a per-session flag that is **never cleared**, so every later check-in
+of that session is answered with `CMD_EXIT` until the teamserver is restarted.
+Control bytes in a result print as `^X`, so a command cannot rewrite the
+operator's terminal; bytes above 0x7f pass through, which keeps UTF-8 intact.
 
 Every request is logged by `set_logger`, which is what produces the
-`[*] POST /api/v2/metrics -> 204` lines — one per check-in, five seconds apart on
-average and jittered ±40%.
+`[*] POST /api/v2/metrics -> 204` lines — one per check-in, 3–7s apart (5s base,
+±40% jitter). All console and handler output goes through `serverOutput.cpp`, so
+a log line arriving mid-keystroke starts on a fresh line instead of landing
+inside `c2_server> `; it still does not put back the line you were typing.
+
+A bare `exit` ends the console thread only. `listen` keeps serving until the
+process is stopped.
 
 ## Endpoints
 
@@ -171,46 +196,73 @@ Both take a `C2_HEADER`-framed body; see the protocol section of the
 
 | Endpoint | Response |
 | --- | --- |
-| `POST /api/v2/metrics` | `200` + framed command, `204` when the queue is empty, `413` if a queued command exceeds the cap |
+| `POST /api/v2/metrics` | `200` + framed command for the calling session, `204` when its queue is empty, `400` for a malformed frame, `413` if a queued command exceeds the cap |
 | `POST /api/v2/events` | `200`, `400` for a malformed frame, `413` above the cap |
 
-Both paths come from `C2_PATH_CHECKIN` / `C2_PATH_RESULT` in `../protocol.h`, not
+Both paths come from `C2_PATH_CHECKIN` / `C2_PATH_RESULT` in `../common/protocol.h`, not
 from literals here, so renaming one side renames both.
 
 `kMaxPayload` (1 MiB) is also applied to the whole request by
 `server.set_payload_max_length`.
 
-### Validation is asymmetric
+### Validation
 
-`/api/v2/events` parses the frame: a body shorter than a header, a wrong `magic`,
-or a `payload_size` that does not account for the rest of the body exactly is a
-`400`. That is what rejects truncation, bad magic and oversized bodies.
+Both handlers call the shared `frame_decode`, so a body shorter than 16 bytes, a
+wrong `magic`, a `session_id` of zero or a `payload_size` that does not account
+for the rest of the body exactly is a `400` on either endpoint.
 
-`/api/v2/metrics` does not look at the body at all (`(void)req;`). Any body is accepted as
-a check-in, which also means the server has no way to tell one implant from
-another. There is no session identifier anywhere.
+`/api/v2/metrics` registers the session the frame names and then serves *that*
+session's queue. `/api/v2/events` acknowledges the command the upload answers,
+but never creates a session.
 
-### The queue
+### Sessions and queues
 
-`g_queue` is a `std::deque<std::string>` behind a mutex, and `take_pending()`
-**pops** from it — the command is consumed by whichever check-in arrives next.
-Two consequences worth knowing before this leaves a lab:
+`SessionStore` is a `std::map<std::uint32_t, Session>` behind a mutex, one entry
+per session id. A session is created by its first check-in and holds a
+`std::deque` of queued commands, the command currently in flight, an
+`exit_requested` flag and `last_seen`.
 
-- two implants interleave each other's commands, since there is one queue;
-- anything that can reach the port can poll `/api/v2/metrics` and take a queued
-  command before the real implant does, and can post well-formed frames to
-  `/api/v2/events` to put arbitrary text on the console.
+- `check_in`, `take`, `queue`, `request_exit` and `snapshot` all sweep first: a
+  session silent for longer than the store's TTL is erased, and its queue with
+  it. The TTL is 60s, the `SessionStore` constructor's default. The implant beacons every 3–7s, so a minute of quiet means it is gone
+  rather than idle.
+- `take` moves the front of the queue into `in_flight` and leaves it there until
+  `/api/v2/events` acknowledges it. A check-in that arrives with that result
+  still missing is answered with the same command again, which is what makes
+  delivery at-least-once instead of lossy.
+- A command is sent at most three times. A fourth check-in with no result drops
+  it and prints `dropped`, so a client that checks in but never uploads cannot
+  keep one command running forever.
+- `acknowledge` also refreshes `last_seen`: a result is proof of life, and a
+  command that ran longer than the TTL must not lose its session before its
+  output lands.
+- An unknown id is answered like an empty queue, so asking for work cannot
+  create a session, and `queue` fails for one, which is what prints
+  `session <id> is gone`.
+
+Three consequences worth knowing before this leaves a lab:
+
+- anything that can reach the port can claim a session id, take its queued
+  command before the real implant does, and post well-formed frames to
+  `/api/v2/events` to put arbitrary text on the console;
+- at-least-once is not exactly-once: when a result upload fails the command is
+  sent again, so a non-idempotent command can run more than once;
+- the label printed with a result is whatever is in flight at that moment, since
+  a result frame names only its session. A duplicate upload of an older result
+  therefore prints unlabelled.
 
 Both endpoints are unauthenticated. See [`../../DEPLOYMENT.md`](../../DEPLOYMENT.md).
 
 ## Limitations
 
-- One global queue, no session identity: implants interleave.
-- `exit` is sticky until restart.
-- No authentication on either endpoint.
+- No authentication on either endpoint: a session id is claimed, not proven.
+- State is in process memory only; a restart loses every queue and exit flag.
+- Delivery is at-least-once with no idempotency: a failed upload re-runs the
+  command, up to three sends.
+- `exit` is sticky until restart, for a session that is still alive.
 - Binds `0.0.0.0`, so the beacon endpoints are reachable on every interface,
   including a VPN's.
-- State is in process memory only; a restart loses the queue and the exit flag.
 - Port and bind address are not configurable without editing the source.
 - Certificate paths are relative to the working directory.
-- Result output is written to the terminal as raw bytes.
+- Control bytes in a result are escaped, but nothing distinguishes a command
+  that printed `^A` from one that printed a real `0x01`.

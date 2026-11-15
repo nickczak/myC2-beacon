@@ -92,6 +92,82 @@ static int is_ip_literal(const char *host)
   return inet_pton(AF_INET6, host, &ipv6) == 1;
 }
 
+/* The whole request head: one POST, no User-Agent, and a close so the read
+   terminates on EOF. Returns the length written, or -1 if it did not fit. */
+static int format_request(char *request, size_t capacity, const char *path,
+                          const char *host, size_t body_len)
+{
+  int length = snprintf(request, capacity,
+                        "POST %s HTTP/1.1\r\n"
+                        "Host: %s\r\n"
+                        "Content-Type: application/octet-stream\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Connection: close\r\n"
+                        "\r\n",
+                        path, host, body_len);
+
+  if (length < 0 || (size_t)length >= capacity)
+  {
+    return -1;
+  }
+  return length;
+}
+
+/* A context that verifies the peer against the system store plus the pinned
+   certificate, and refuses anything below TLS 1.2. Returns NULL after
+   reporting the reason. */
+static SSL_CTX *create_tls_context(const char *ca_file)
+{
+  SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+
+  if (ctx == NULL)
+  {
+    report_tls_failure("could not create TLS context");
+    return NULL;
+  }
+  (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+  (void)SSL_CTX_set_default_verify_paths(ctx);
+
+  if (ca_file != NULL && SSL_CTX_load_verify_locations(ctx, ca_file, NULL) != 1)
+  {
+    report_tls_failure(ca_file);
+    SSL_CTX_free(ctx);
+    return NULL;
+  }
+  return ctx;
+}
+
+/* Pin the identity, not just the chain: an IP literal is matched against the
+   certificate's IP SAN, a name against its DNS SAN (with SNI). Returns 0, or
+   -1 after reporting the reason. */
+static int pin_identity(SSL *ssl, const char *host)
+{
+  X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
+
+  if (is_ip_literal(host))
+  {
+    if (X509_VERIFY_PARAM_set1_ip_asc(param, host) != 1)
+    {
+      report_tls_failure("could not set expected IP address");
+      return -1;
+    }
+    return 0;
+  }
+
+  if (X509_VERIFY_PARAM_set1_host(param, host, 0) != 1)
+  {
+    report_tls_failure("could not set expected host name");
+    return -1;
+  }
+  if (SSL_set_tlsext_host_name(ssl, host) != 1)
+  {
+    report_tls_failure("could not set SNI host name");
+    return -1;
+  }
+  return 0;
+}
+
 /* Connect to host:port, applying timeouts so a dead server cannot hang the
    implant forever. */
 static int connect_to(const char *host, int port)
@@ -234,6 +310,43 @@ static char *find_body(const struct buffer *raw, size_t *body_len)
   return NULL;
 }
 
+/* Hand back a malloc'd copy of the response body, or a NULL pointer and a
+   length of 0 when the response carried none. Returns -1 if the headers never
+   terminated (already reported). */
+static int copy_body(const struct buffer *raw, char **out_body, size_t *out_len)
+{
+  size_t body_len = 0;
+  char *body = find_body(raw, &body_len);
+
+  if (body == NULL)
+  {
+    fprintf(stderr, "response had no header terminator\n");
+    return -1;
+  }
+
+  if (out_body != NULL && body_len != 0)
+  {
+    char *copy = malloc(body_len);
+
+    if (copy == NULL)
+    {
+      return -1;
+    }
+    memcpy(copy, body, body_len);
+    *out_body = copy;
+  }
+  else if (out_body != NULL)
+  {
+    *out_body = NULL;
+  }
+
+  if (out_len != NULL)
+  {
+    *out_len = body_len;
+  }
+  return 0;
+}
+
 int https_post(const char *host, int port, const char *path, const char *body,
                size_t body_len, const char *ca_file, char **out_body,
                size_t *out_len)
@@ -251,32 +364,15 @@ int https_post(const char *host, int port, const char *path, const char *body,
     return -1;
   }
 
-  request_len = snprintf(request, sizeof(request),
-                         "POST %s HTTP/1.1\r\n"
-                         "Host: %s\r\n"
-                         "Content-Type: application/octet-stream\r\n"
-                         "Content-Length: %zu\r\n"
-                         "Connection: close\r\n"
-                         "\r\n",
-                         path, host, body_len);
-  if (request_len < 0 || (size_t)request_len >= sizeof(request))
+  request_len = format_request(request, sizeof(request), path, host, body_len);
+  if (request_len < 0)
   {
     return -1;
   }
 
-  ctx = SSL_CTX_new(TLS_client_method());
+  ctx = create_tls_context(ca_file);
   if (ctx == NULL)
   {
-    report_tls_failure("could not create TLS context");
-    goto cleanup;
-  }
-  (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-  SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-  (void)SSL_CTX_set_default_verify_paths(ctx);
-
-  if (ca_file != NULL && SSL_CTX_load_verify_locations(ctx, ca_file, NULL) != 1)
-  {
-    report_tls_failure(ca_file);
     goto cleanup;
   }
 
@@ -299,32 +395,9 @@ int https_post(const char *host, int port, const char *path, const char *body,
     goto cleanup;
   }
 
-  /* Pin the identity, not just the chain: an IP literal is matched against the
-     certificate's IP SAN, a name against its DNS SAN (with SNI). */
+  if (pin_identity(ssl, host) != 0)
   {
-    X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
-
-    if (is_ip_literal(host))
-    {
-      if (X509_VERIFY_PARAM_set1_ip_asc(param, host) != 1)
-      {
-        report_tls_failure("could not set expected IP address");
-        goto cleanup;
-      }
-    }
-    else
-    {
-      if (X509_VERIFY_PARAM_set1_host(param, host, 0) != 1)
-      {
-        report_tls_failure("could not set expected host name");
-        goto cleanup;
-      }
-      if (SSL_set_tlsext_host_name(ssl, host) != 1)
-      {
-        report_tls_failure("could not set SNI host name");
-        goto cleanup;
-      }
-    }
+    goto cleanup;
   }
 
   if (SSL_connect(ssl) != 1)
@@ -363,36 +436,10 @@ int https_post(const char *host, int port, const char *path, const char *body,
     goto cleanup;
   }
 
+  if (copy_body(&raw, out_body, out_len) != 0)
   {
-    size_t response_body_len = 0;
-    char *response_body = find_body(&raw, &response_body_len);
-
-    if (response_body == NULL)
-    {
-      fprintf(stderr, "response had no header terminator\n");
-      status = -1;
-      goto cleanup;
-    }
-
-    if (out_body != NULL && response_body_len != 0)
-    {
-      char *copy = malloc(response_body_len);
-      if (copy == NULL)
-      {
-        status = -1;
-        goto cleanup;
-      }
-      memcpy(copy, response_body, response_body_len);
-      *out_body = copy;
-    }
-    else if (out_body != NULL)
-    {
-      *out_body = NULL;
-    }
-    if (out_len != NULL)
-    {
-      *out_len = response_body_len;
-    }
+    status = -1;
+    goto cleanup;
   }
 
 cleanup:

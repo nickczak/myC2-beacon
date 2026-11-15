@@ -20,6 +20,7 @@ struct C2_HEADER {
   uint32_t magic;
   uint32_t command_id;
   uint32_t payload_size;
+  uint32_t session_id;
 };
 
 #endif

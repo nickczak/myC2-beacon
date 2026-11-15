@@ -4,9 +4,10 @@ The victim side. It polls the teamserver over HTTPS for work, runs what it is
 given, uploads the output, and never listens on a port.
 
 ```
-   1. build a 12-byte C2_HEADER {0x41414141, 100, 0}
-   2. TCP connect → TLS handshake → POST /api/v2/metrics
-   3. 204 → sleep 3–7s (jittered) → back to 1
+   1. draw a session id once, from RAND_bytes
+   2. build a 16-byte C2_HEADER {0x41414141, 100, 0, <session id>}
+   3. TCP connect → TLS handshake → POST /api/v2/metrics
+   4. 204 → sleep 3–7s (jittered) → back to 2
       200 + CMD_EXIT          → exit
       200 + CMD_EXECUTE_SHELL → popen it, then POST /api/v2/events with the output
 ```
@@ -19,10 +20,15 @@ recover from when the server restarts.
 
 | File | Contents |
 | --- | --- |
-| `agent.c` | argument parsing, the beacon loop, `popen`-based command execution |
+| `agent.c` | `main`: seed, parse flags, draw the session id, run the loop |
+| `config.c` | defaults, flag parsing, `RAND_bytes` identity |
+| `beacon.c` | one check-in, the response check, the jittered sleep |
+| `frame_post.c` | frame one message and POST it to a path |
+| `tasks.c` | `popen`, output collection, upload of the result |
 | `https_client.c` | the transport: sockets, OpenSSL, request and response handling |
 | `https_client.h` | `https_post()` |
-| `../protocol.h` | `C2_HEADER` and the `CMD_*` constants, shared with the server |
+| `../common/protocol.h` | `C2_HEADER`, the `CMD_*` constants and the two paths |
+| `../common/frame.c` | `frame_encode` / `frame_decode` / `frame_payload`, shared with the server |
 
 ## Why not libcurl
 
@@ -175,13 +181,20 @@ timer. Whole-second jitter was tried first and abandoned: every short draw round
 to the same value, which left a visible 3s pattern.
 
 A `200` response is verified before it is trusted: the body must be at least a
-header, the `magic` must match, and `payload_size + 12` must equal the body length
-exactly. Anything else prints `bad response` and the loop continues.
+header, the `magic` must match, `payload_size + 16` must equal the body length
+exactly, and the `session_id` must be this implant's own. Anything else prints
+`bad response` and the loop continues. The first three checks are
+`frame_decode`; the identity check is here, because only the implant knows which
+session it is.
 
 | command | action |
 | --- | --- |
 | `CMD_EXIT` | silently breaks the loop and exits 0 |
 | `CMD_EXECUTE_SHELL` | `popen(cmd, "r")`, read up to `OUTPUT_MAX` bytes, `POST /api/v2/events` |
+
+The pipe is drained to EOF even after the buffer is full, so a command that
+prints a lot neither blocks on a full pipe nor looks like a short one: the
+upload ends with `[output truncated]` when bytes were dropped.
 
 A failed beacon prints `request failed (<n>)` and retries on the next interval; a TLS failure prints the reason and the loop continues. The implant does
 not give up on its own.
@@ -189,13 +202,15 @@ not give up on its own.
 ## Limitations
 
 - **`OUTPUT_MAX` is 4096 bytes**, and output is only collected once the command
-  exits — a long-running command produces nothing until it finishes.
+  exits — a long-running command produces nothing until it finishes. Clipped
+  output is marked `[output truncated]`.
 - **Cadence is still periodic.** Jittered to 3–7s, but a fixed destination on a
   schedule remains a pattern in flow logs.
-- **Binary-unsafe results.** Output is uploaded raw and printed raw by the server,
-  so non-UTF-8 output corrupts the operator's terminal.
-- **No authentication** of the server beyond the certificate check, and no client
-  identity sent at all.
+- **Results are bytes, not text.** The server escapes control characters before
+  printing, but nothing marks whether the command meant them as text.
+- **No authentication** in either direction: the server is known only by the
+  certificate the implant pins, and the client sends no proof of identity — a
+  session id is claimed, not proven.
 - **Command strings are passed to `popen`**, so `sh -c` semantics apply,
   metacharacters included.
 - **No sleep/kill switch**, and no way to change the interval without rebuilding.
