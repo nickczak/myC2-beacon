@@ -77,30 +77,31 @@ sees opaque records either way.
 The self-signed chain. It is the cheapest thing for any inline sensor or proxy to
 flag, and it is the reason the certificate discussion is not cosmetic.
 
-### A trust bug, verified by reading
+### The trust-anchor bug that used to be here
 
-`https_client.c` does this:
+`https_client.c` used to load the system store and then *add* the pinned file:
 
 ```c
 SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
 (void)SSL_CTX_set_default_verify_paths(ctx);          /* loads the system store */
-if (ca_file != NULL && SSL_CTX_load_verify_locations(ctx, ca_file, NULL) != 1) ...
+SSL_CTX_load_verify_locations(ctx, ca_file, NULL);    /* adds to it */
 ```
 
-`load_verify_locations` **adds** trust anchors; it does not replace the system
-store loaded by `set_default_verify_paths`. So trust is the **union** of the
-pinned file and every public root on the victim.
+`load_verify_locations` **adds** anchors; it does not replace what
+`set_default_verify_paths` loaded, so trust was the **union** of the pinned file
+and every public root on the victim. On a host with a corporate TLS-inspection
+root (most managed endpoints) a proxy presenting a forged certificate for the C2
+hostname would have **passed**, and so would any publicly-trusted certificate
+for that name.
 
-Consequence: the "pinning" described in the README is not exclusive. On a host
-with a corporate TLS-inspection root installed (most managed endpoints), a proxy
-presenting a forged certificate for the C2 hostname will **pass** verification.
-The same applies to any publicly-trusted certificate for that name.
+**Fixed.** When a CA file is given the system store is never loaded, so the
+pinned certificate is the only anchor and verification means "this certificate
+or nothing". The system store is reached only when no CA is supplied, which the
+implant never does — `config.c` defaults `--ca` to `certs/server.pem`. Verified
+with `SSL_CERT_FILE` pointed at the real certificate and `--ca` at an unrelated
+one: the handshake is refused.
 
-For a bare IP target this is mostly theoretical, because public CAs do not
-generally issue IP certificates. For a DNS name it is a real hole. Fix: drop the
-`set_default_verify_paths` call when a pinned CA is supplied.
-
-Related: the SAN is covered by one `SERVER_IP` and one `SERVER_HOST`
+Still open — the SAN is covered by one `SERVER_IP` and one `SERVER_HOST`
 (`src/server/CMakeLists.txt`). One certificate therefore cannot name both the
 public address victims dial and the VPN address an operator dials.
 
@@ -200,8 +201,9 @@ Ordered by what unblocks deployment, not by difficulty.
 5. **Operator API.** `std::getline(std::cin)` cannot be driven remotely. Replace
    the console with authenticated HTTP endpoints to queue commands and read
    results, bound to the VPN interface only.
-6. **Exclusive trust anchor.** Drop `set_default_verify_paths` when a pinned CA
-   is given, so verification means "this CA or nothing".
+6. ~~**Exclusive trust anchor.**~~ **Done.** `create_tls_context` loads the
+   pinned CA alone; the system store is only touched when no CA is passed, so
+   verification means "this CA or nothing".
 7. **Multi-IP SAN.** Accept a list in `SERVER_IP` so one certificate can name the
    public address and the VPN address.
 
@@ -268,6 +270,6 @@ interval, and an implant binary with no symbol table, build id, compiler version
 or role-shaped strings.
 
 Not yet true: authentication in either direction, exactly-once delivery, a
-persistent queue, a remote operator interface, root-pinned trust, or any
-configurability of port, path or bind address. It is a working beacon channel;
+persistent queue, a remote operator interface, or any configurability of port,
+path or bind address. It is a working beacon channel;
 it is not deployable infrastructure.

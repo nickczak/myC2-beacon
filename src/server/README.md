@@ -20,10 +20,10 @@ beacon instead of arriving immediately.
 | File | Contents |
 | --- | --- |
 | `server.cpp` | `main`, certificate loading, `listen`, request logging |
-| `operatorConsole.cpp` | `sessions` / `use` / `exit`, and queueing everything else |
+| `operatorConsole.cpp` | `sessions` / `use` / `exit` / `quit`, and queueing everything else |
 | `serverOutput.cpp` | the single write path to stdout: messages, prompt, `hex_id` |
 | `endpoints/beaconEndpoints.cpp` | the two request handlers |
-| `endpoints/beaconEndpoints.hpp` | `kPort`, `kMaxPayload`, `Pending` |
+| `endpoints/beaconEndpoints.hpp` | `kPort`, `kMaxPayload` |
 | `endpoints/sessionStore.cpp` | per-session queues, the in-flight command, TTL sweep |
 | `endpoints/sessionStore.hpp` | `Session`, `SessionInfo`, `Pending`, `SessionStore` |
 
@@ -71,9 +71,9 @@ build — there is no lint target.
 
 `certs/` is gitignored, so a fresh clone has none. The build generates a
 self-signed pair into `certs/server.pem` and `certs/server.key` whenever either
-file is missing (RSA 2048, valid 365 days, `CN=localhost`). **Existing
-certificates are never overwritten**, so the trust anchor cannot rotate out from
-under a running implant.
+file is missing (RSA 2048, valid 365 days, `CN=localhost`). An existing pair is
+left alone unless the SAN stamp changes, so a plain rebuild cannot rotate the
+trust anchor out from under a running implant.
 
 The server loads both paths relative to the working directory, as compile-time
 constants in `server.cpp`:
@@ -136,14 +136,16 @@ c2_server>
 
 The port is the compile-time constant `kPort` in `beaconEndpoints.hpp`. There is
 no command-line argument to change it or the bind address; both are `0.0.0.0`
-and `8443` as written. If the port is taken, the server prints
-`[-] Failed to bind 0.0.0.0:8443` and exits.
+and `8443` as written. A bind failure prints `[-] Failed to bind 0.0.0.0:8443`
+and exits with code 1, but a second instance is not one: cpp-httplib sets
+`SO_REUSEPORT`, so two teamservers share 8443 instead of the second one failing.
+Verified with two live instances both in `LISTEN`.
 
 ### Operator console
 
-The port is bound before the console thread starts, so a port already in use
-fails immediately instead of leaving a thread blocked on stdin. After that a
-detached thread reads `std::cin` while `listen` runs.
+The port is bound before the console thread starts, so a genuine bind failure
+returns before any thread is left blocked on stdin. After that a detached thread
+reads `std::cin` while `listen` runs.
 
 | input | effect |
 | --- | --- |
@@ -186,8 +188,10 @@ Every request is logged by `set_logger`, which is what produces the
 a log line arriving mid-keystroke starts on a fresh line instead of landing
 inside `c2_server> `; it still does not put back the line you were typing.
 
-A bare `exit` ends the console thread only. `listen` keeps serving until the
-process is stopped.
+`quit` ends the console thread; `listen` keeps serving until the process is
+stopped. A bare `exit` is not an alias for it: it targets the selected session,
+and with none selected it prints the same `no session selected` error as any
+other command.
 
 ## Endpoints
 

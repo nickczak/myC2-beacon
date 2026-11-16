@@ -50,11 +50,14 @@ for `popen`, `nanosleep` and `getaddrinfo`), and links only `OpenSSL::SSL`,
 
 ### Artifact hardening
 
-The `agent` target is stripped as part of a normal build: `-s` and `-fno-ident`,
-`-Wl,--build-id=none`, then an `objcopy` pass that removes `.comment` — the one
-section `strip` cannot. The result carries no `.symtab`, no build id and no
-compiler version, and no string in it names the beacon, the role or the paths.
-Sanitizer builds skip all of it, since symbols are the point there.
+The `agent` target is stripped as part of a normal build: `-s` and
+`-fno-ident`, `-Wl,--build-id=none`, then an `objcopy` pass that removes
+`.comment` — the one section `strip` cannot. The result carries no `.symtab`, no
+build id and no compiler version. `strings` still finds plenty: the two endpoint
+paths, the TLS failure messages, and the usage text, which names the teamserver
+outright. What is gone is the shape of the code — no function or struct names,
+and no build provenance. Sanitizer builds skip all of it, since symbols are the
+point there.
 
 It does not need cpp-httplib, so it builds without the teamserver — which is what
 the container script does:
@@ -88,9 +91,9 @@ container gets `Permission denied` on `/src`. That relaxes the container's own
 confinement instead of relabelling your files, which is what appending `:z` to the
 mount would do.
 
-Both the host build and the container build reference at most `GLIBC_2.34`, so
-either runs on glibc 2.34 or newer (Debian 12, Ubuntu 22.04, RHEL 9). The
-container does not lower that floor on its own — it makes the result
+The host build references at most `GLIBC_2.34` (checked with `objdump -T`), so it
+runs on glibc 2.34 or newer (Debian 12, Ubuntu 22.04, RHEL 9). The container does
+not lower that floor on its own — it pins the image so the result is
 reproducible. An older base image is the only way below 2.34, and it drags the
 older OpenSSL soname along with it (Debian 11 and Ubuntu 20.04 ship
 `libssl.so.1.1` rather than `libssl.so.3`), so the victim's ABI decides which
@@ -117,12 +120,18 @@ installed (`libasan`/`libubsan` on Fedora).
 ```
 
 It prints nothing on start-up and nothing on a successful check-in. Only failures
-reach `stderr`, none of them naming the role, the path or the destination:
+reach `stderr`, as short fixed messages that never echo the command or its
+output:
 
 ```
 request failed (500)
 bad response
+TLS handshake failed: certificate verify failed
 ```
+
+Those messages are not silent about the destination: `could not connect to
+<host>:<port>` names it on every failed attempt, and `--help` prints the default
+host, port and CA path.
 
 The port is validated as 1–65535; a non-numeric value, trailing junk or an
 out-of-range number prints `invalid port: <value>` and exits with code 2. Unknown
@@ -155,22 +164,24 @@ Connection: close
 
 No `User-Agent` and no `Accept*` headers. Note that `Host` omits the port.
 
-### Pinning is not exclusive
+### The pinned CA is the only anchor
 
-The client loads the system trust store **and** the `--ca` file:
+When `--ca` is supplied, the client loads that file and nothing else:
 
 ```c
 SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-(void)SSL_CTX_set_default_verify_paths(ctx);
-SSL_CTX_load_verify_locations(ctx, ca_file, NULL);
+if (ca_file != NULL) {
+  SSL_CTX_load_verify_locations(ctx, ca_file, NULL);   /* exclusive */
+}
 ```
 
-`load_verify_locations` adds anchors; it does not replace what
-`set_default_verify_paths` loaded. Trust is the union of the two, so a host with
-a corporate TLS-inspection root installed will accept a forged certificate for the
-C2 hostname. For a bare IP target this is mostly academic, because public CAs do
-not generally issue IP certificates; for a DNS name it is a real hole.
-[`../../DEPLOYMENT.md`](../../DEPLOYMENT.md) tracks the fix.
+The system store is loaded only when the caller passes no CA at all, which the
+implant never does: `config.c` defaults `--ca` to `certs/server.pem`. This
+matters because `load_verify_locations` **adds** anchors rather than replacing
+them, so loading both would make trust the union of the pinned file and every
+public root on the victim — and a host with a corporate TLS-inspection root
+would then accept a forged certificate for the C2 hostname. Verification now
+means "this certificate or nothing".
 
 ## Beacon loop
 
@@ -190,7 +201,7 @@ session it is.
 | command | action |
 | --- | --- |
 | `CMD_EXIT` | silently breaks the loop and exits 0 |
-| `CMD_EXECUTE_SHELL` | `popen(cmd, "r")`, read up to `OUTPUT_MAX` bytes, `POST /api/v2/events` |
+| `CMD_EXECUTE_SHELL` | `popen(cmd, "r")`, keep at most `OUTPUT_MAX` bytes including the truncation marker, `POST /api/v2/events` |
 
 The pipe is drained to EOF even after the buffer is full, so a command that
 prints a lot neither blocks on a full pipe nor looks like a short one: the
