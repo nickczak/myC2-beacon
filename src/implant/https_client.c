@@ -113,9 +113,11 @@ static int format_request(char *request, size_t capacity, const char *path,
   return length;
 }
 
-/* A context that verifies the peer against the system store plus the pinned
-   certificate, and refuses anything below TLS 1.2. Returns NULL after
-   reporting the reason. */
+/* A context that trusts the pinned certificate exclusively, and refuses
+   anything below TLS 1.2. The system store is loaded only when no pinned
+   certificate is supplied: loading both would leave trust as the union, so a
+   host-installed root (corporate TLS inspection) could vouch for the
+   teamserver. Returns NULL after reporting the reason. */
 static SSL_CTX *create_tls_context(const char *ca_file)
 {
   SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
@@ -127,11 +129,21 @@ static SSL_CTX *create_tls_context(const char *ca_file)
   }
   (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
   SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-  (void)SSL_CTX_set_default_verify_paths(ctx);
 
-  if (ca_file != NULL && SSL_CTX_load_verify_locations(ctx, ca_file, NULL) != 1)
+  if (ca_file != NULL)
   {
-    report_tls_failure(ca_file);
+    if (SSL_CTX_load_verify_locations(ctx, ca_file, NULL) != 1)
+    {
+      report_tls_failure(ca_file);
+      SSL_CTX_free(ctx);
+      return NULL;
+    }
+    return ctx;
+  }
+
+  if (SSL_CTX_set_default_verify_paths(ctx) != 1)
+  {
+    report_tls_failure("could not load the system trust store");
     SSL_CTX_free(ctx);
     return NULL;
   }
